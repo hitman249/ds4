@@ -691,10 +691,38 @@ static int routed_moe_launch(
                                            &up_slot_ptrs,
                                            &down_slot_ptrs,
                                            &stream_batch_unique);
-    /* The one-token resident/missing split can expose partially updated
-     * selected-expert state to the default stream. Keep the asynchronous
-     * read overlap, then use the deterministic compact table below. */
+    /* One-token resident/missing split. It runs the resident experts
+     * first, joins the asynchronous missing reads, then runs the missing
+     * experts from per-expert slot pointers instead of copying every expert
+     * into the compact table. The reuse event is still recorded after these
+     * kernels (compact_selected below), so the next layer's plan cannot
+     * rewrite the selected-id tensor or evict slots while they are read.
+     * Default on gfx1151 (validated bit-identical against the compact path);
+     * DS4_ROCM_V41_MOE_SPLIT=0 keeps the compact path, =1 forces the split
+     * on other ROCm parts. */
     int split_selected = 0;
+    if (ds4_rocm_gfx1151_flag("DS4_ROCM_V41_MOE_SPLIT") &&
+        !stream_full_layer &&
+        !full_table_cached &&
+        n_tokens == 1u &&
+        (iq2_gate_path || q2k_path) &&
+        n_expert <= DS4_ROCM_N_EXPERT_USED) {
+        split_selected = cuda_stream_selected_apply_split(model_map,
+                                                          layer_index,
+                                                          n_total_expert,
+                                                          n_expert,
+                                                          gate_expert_bytes,
+                                                          down_expert_bytes,
+                                                          &selected_exec,
+                                                          &gate_w,
+                                                          &up_w,
+                                                          &down_w,
+                                                          &gate_slot_ptrs,
+                                                          &up_slot_ptrs,
+                                                          &down_slot_ptrs,
+                                                          &stream_resident_mask,
+                                                          &stream_missing_mask);
+    }
     const int compact_selected =
         split_selected ||
         (!stream_full_layer &&
@@ -1288,8 +1316,7 @@ static int routed_moe_launch(
                 n_expert <= DS4_ROCM_N_EXPERT_USED &&
                 !q4k_path &&
                 !sorted_pairs &&
-                stream_resident_mask != 0 &&
-                stream_missing_mask != 0;
+                (stream_resident_mask | stream_missing_mask) != 0;
             if (split_supported) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (use_v41_wave_gate) {

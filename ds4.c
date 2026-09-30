@@ -1643,7 +1643,7 @@ static void ds4_expert_profile_init(const char *path, const char *hotlist_path) 
         g_expert_profile.caps[g_expert_profile.n_caps++] = cap;
     }
     fprintf(stderr,
-            "ds4: Metal expert locality profiler active (profile: %s, hotlist: %s)\n",
+            "ds4: expert locality profiler active (profile: %s, hotlist: %s)\n",
             g_expert_profile.path ? g_expert_profile.path : "disabled",
             g_expert_profile.hotlist_path ? g_expert_profile.hotlist_path : "disabled");
 }
@@ -1894,7 +1894,7 @@ static void ds4_expert_profile_write_hotlist_file(ds4_expert_profile *p) {
                 strerror(errno));
     } else {
         fprintf(stderr,
-                "ds4: wrote Metal expert hotlist to %s "
+                "ds4: wrote expert hotlist to %s "
                 "(%" PRIu64 " layer records, %" PRIu64 " selections)\n",
                 p->hotlist_path,
                 p->total_records,
@@ -1916,7 +1916,7 @@ static void ds4_expert_profile_close(void) {
         } else {
 
             fputs("{\n", fp);
-            fputs("  \"source\": \"ds4 Metal expert locality profile\",\n", fp);
+            fputs("  \"source\": \"ds4 expert locality profile\",\n", fp);
             fputs("  \"model\": ", fp);
             ds4_json_write_string(fp, p->model_name);
             fputs(",\n", fp);
@@ -1952,7 +1952,7 @@ static void ds4_expert_profile_close(void) {
                         strerror(errno));
             } else {
                 fprintf(stderr,
-                        "ds4: wrote Metal expert locality profile to %s "
+                        "ds4: wrote expert locality profile to %s "
                         "(%" PRIu64 " layer records, %" PRIu64 " selections)\n",
                         p->path,
                         p->total_records,
@@ -40364,6 +40364,33 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
 /* Empty slot marker: a position never collides because positions < 2^30. */
 #define DS41_FRONTIER_EMPTY UINT32_MAX
 
+/* Diagnostic (DS4_ROCM_V41_FRONTIER_DEBUG=1): log every frontier capture,
+ * the lock-free hint scan, and the authoritative restore so a missing prefix
+ * reuse can be traced to the snapshot ring rather than guessed at. */
+static int ds41_frontier_debug_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_V41_FRONTIER_DEBUG");
+        cached = env && env[0] != '\0' && strcmp(env, "0") != 0;
+    }
+    return cached;
+}
+
+static void ds41_frontier_debug_ring(const ds41_gpu_graph *g, const char *what,
+                                     int desired) {
+    if (!g || !g->frontier_state) return;
+    fprintf(stderr, "ds4: frontier %s desired=%d slots=%u:", what, desired,
+            g->frontier_slots);
+    for (uint32_t slot = 0; slot < g->frontier_slots; slot++) {
+        const uint32_t state =
+            __atomic_load_n(&g->frontier_state[slot], __ATOMIC_ACQUIRE);
+        if (state == DS41_FRONTIER_EMPTY) continue;
+        fprintf(stderr, " [%u]=%u%s", slot, state >> 1u,
+                (state & 1u) ? "+logits" : "");
+    }
+    fputc('\n', stderr);
+}
+
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
 #ifdef DS4_ROCM_BUILD
@@ -40544,6 +40571,9 @@ static void ds41_frontier_capture_slot(ds41_gpu_graph *g, uint32_t slot,
         memcpy(g->frontier_logits + (uint64_t)slot * DS4_N_VOCAB, logits,
                (uint64_t)DS4_N_VOCAB * sizeof(float));
     ds41_frontier_publish(g, slot, pos, with_logits && logits != NULL);
+    if (ds41_frontier_debug_enabled())
+        fprintf(stderr, "ds4: frontier capture slot=%u pos=%u logits=%d\n",
+                slot, pos, (with_logits && logits != NULL) ? 1 : 0);
 }
 
 static void ds41_frontier_capture_prefill(ds41_gpu_graph *g, uint32_t pos,
@@ -40586,8 +40616,7 @@ static int ds41_frontier_restore(ds41_gpu_graph *g, int desired, float *logits) 
     }
     if (best < 0) return -1;
     /* Snapshots ahead of the restored frontier belong to a token suffix the
-     * rewind discards; a later divergent prefill would invalidate them. */
-    for (uint32_t slot = 0; slot < g->frontier_slots; slot++) {
+     * rewind discards; a later divergent prefill would invalidate them. */    for (uint32_t slot = 0; slot < g->frontier_slots; slot++) {
         const uint32_t state = __atomic_load_n(&g->frontier_state[slot], __ATOMIC_ACQUIRE);
         if (state != DS41_FRONTIER_EMPTY && (int)(state >> 1u) > (int)best_pos)
             ds41_frontier_clear_slot(g, slot);
@@ -40609,6 +40638,9 @@ static int ds41_frontier_restore(ds41_gpu_graph *g, int desired, float *logits) 
     if (best_logits && logits)
         memcpy(logits, g->frontier_logits + (uint64_t)best * DS4_N_VOCAB,
                (uint64_t)DS4_N_VOCAB * sizeof(float));
+    if (ds41_frontier_debug_enabled())
+        fprintf(stderr, "ds4: frontier restore desired=%d slot=%d pos=%u logits=%d\n",
+                desired, best, best_pos, best_logits ? 1 : 0);
     return (int)best_pos;
 }
 
@@ -41148,6 +41180,69 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
+/* =========================================================================
+ * V4.1 decode stage profiler (DS4_ROCM_V41_DECODE_PROFILE).
+ *
+ * Prints one line per decoded token with where the step spends time: host-side
+ * graph encoding, the per-layer selected-expert readback, the expert-cache
+ * plan, the routed MoE submission (which includes the consumer join: read
+ * waits plus compact copies), and the GPU wait implied by the per-layer drain.
+ * DS4_ROCM_V41_DECODE_PROFILE_LAYER=1 adds one line per layer. Inert unless the
+ * environment variable is set, so it stays compiled for every backend.
+ * ========================================================================= */
+typedef struct {
+    double pre;        /* host: attention/HC/norm encoding */
+    double moe;        /* host: router + shared + routed MoE encoding */
+    double post;       /* host: post-MoE reduction encoding */
+    double sel_read;   /* selected-id readback (D2H copy + stream drain) */
+    double sel_plan;   /* expert-cache lookup/allocation plan */
+    double moe_launch; /* routed MoE submission incl. consumer join */
+    double gpu_wait;   /* per-layer drain (GPU execution + sync) */
+} ds41_dec_phases;
+
+static struct {
+    int inited;
+    int on;
+    int layer_on;
+    ds41_dec_phases tok;
+} g_v41_decprof;
+
+static int ds41_decprof_enabled(void) {
+    if (!g_v41_decprof.inited) {
+        g_v41_decprof.inited = 1;
+        g_v41_decprof.on = getenv("DS4_ROCM_V41_DECODE_PROFILE") != NULL;
+        g_v41_decprof.layer_on = g_v41_decprof.on &&
+            getenv("DS4_ROCM_V41_DECODE_PROFILE_LAYER") != NULL;
+    }
+    return g_v41_decprof.on;
+}
+
+static double ds41_decprof_now(void) {
+    return ds41_decprof_enabled() ? now_sec() : 0.0;
+}
+
+static void ds41_decprof_add(double *slot, double t0) {
+    if (t0 > 0.0) *slot += now_sec() - t0;
+}
+
+static void ds41_decprof_reset(void) {
+    memset(&g_v41_decprof.tok, 0, sizeof(g_v41_decprof.tok));
+}
+
+static void ds41_decprof_print_token(int token, uint32_t pos, double total) {
+    const ds41_dec_phases *p = &g_v41_decprof.tok;
+    const double host = p->pre + p->moe + p->post;
+    fprintf(stderr,
+            "ds4: V4.1 decode profile tok=%d pos=%u total=%.1fms "
+            "host[pre=%.1f moe=%.1f post=%.1f]=%.1f "
+            "moe_sub[read=%.1f plan=%.1f launch=%.1f] gpu=%.1f rest=%.1f\n",
+            token, pos, total * 1000.0,
+            p->pre * 1000.0, p->moe * 1000.0, p->post * 1000.0, host * 1000.0,
+            p->sel_read * 1000.0, p->sel_plan * 1000.0, p->moe_launch * 1000.0,
+            p->gpu_wait * 1000.0, (total - host - p->gpu_wait) * 1000.0);
+    ds41_decprof_reset();
+}
+
 #ifdef DS4_ROCM_BUILD
 /* The first ROCm streaming path uses one uniform Q2 expert size class. */
 static bool ds41_stream_table(const ds4_model *m, const ds4_layer_weights *l,
@@ -41177,13 +41272,32 @@ static bool ds41_stream_table(const ds4_model *m, const ds4_layer_weights *l,
 static bool ds41_stream_selected_begin(ds41_gpu_graph *g, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t il) {
     ds4_gpu_stream_expert_table table;
-    int32_t selected[6];
+    /* Full-width arrays keep the profiler contract; only the routed count is
+     * ever read from the graph tensor. */
+    int32_t selected[DS4_MAX_EXPERT_USED] = {0};
+    const double t_read = ds41_decprof_now();
     if (!ds41_stream_table(m, l, il, &table) ||
-        !ds4_gpu_tensor_read(g->selected, 0, selected, sizeof(selected))) return false;
-    for (uint32_t i = 0; i < 6; i++)
+        !ds4_gpu_tensor_read(g->selected, 0, selected,
+                             (uint64_t)DS4_N_EXPERT_USED * sizeof(selected[0]))) return false;
+    ds41_decprof_add(&g_v41_decprof.tok.sel_read, t_read);
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++)
         if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) return false;
-    return ds4_gpu_routed_moe_set_selected_override(selected, 6) &&
-        ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 6);
+    if (g_expert_profile.active) {
+        /* Diagnostic only: the profiler needs the router weights next to the
+         * ids that this path already reads back, so the extra readback costs
+         * nothing in normal runs. Decode routing is what the streaming expert
+         * cache serves, so record it here. */
+        float weights[DS4_MAX_EXPERT_USED] = {0};
+        if (!ds4_gpu_tensor_read(g->route_weights, 0, weights,
+                                 (uint64_t)DS4_N_EXPERT_USED * sizeof(weights[0]))) return false;
+        ds4_expert_profile_record(il, g->pos, selected, weights,
+                                  l->ffn_gate_tid2eid != NULL);
+    }
+    const double t_plan = ds41_decprof_now();
+    const bool plan_ok = ds4_gpu_routed_moe_set_selected_override(selected, DS4_N_EXPERT_USED) &&
+        ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, DS4_N_EXPERT_USED);
+    ds41_decprof_add(&g_v41_decprof.tok.sel_plan, t_plan);
+    return plan_ok;
 }
 #endif
 
@@ -41231,6 +41345,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
     bool routed_ok;
+    const double t_launch = ds41_decprof_now();
 #ifdef DS4_ROCM_BUILD
     if (g->tp_world == 2u) {
         routed_ok = ds4_gpu_dsv41_routed_moe_tp_tensor(routed, g->gate, g->up, g->mid, g->experts,
@@ -41256,6 +41371,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
             !g->streaming);
+    ds41_decprof_add(&g_v41_decprof.tok.moe_launch, t_launch);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
@@ -41640,8 +41756,18 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    const double t0 = ds41_decprof_now();
+    if (!ds41_graph_before_moe(g, m, l, il)) return false;
+    const double t1 = ds41_decprof_now();
+    if (!ds41_moe(g, m, l, il, (uint32_t)token)) return false;
+    const double t2 = ds41_decprof_now();
+    const bool ok = ds41_graph_after_moe(g);
+    if (t0 > 0.0) {
+        g_v41_decprof.tok.pre += t1 - t0;
+        g_v41_decprof.tok.moe += t2 - t1;
+        g_v41_decprof.tok.post += now_sec() - t2;
+    }
+    return ok;
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41805,6 +41931,11 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    double t_step0 = 0.0;
+    if (ds41_decprof_enabled()) {
+        ds41_decprof_reset();
+        t_step0 = now_sec();
+    }
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
@@ -41831,11 +41962,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         (g->tp_world == 1u && !g->streaming && !g->quality && !g->imatrix &&
          !g->image_count && !g_expert_profile.active &&
          !getenv("DS4_ROCM_DISABLE_V41_RESIDENT_QUEUE")) ||
+        /* Opt-in SSD-streaming overlap. Safe because the expert-cache reuse
+         * event (recorded after the routed MoE on the default stream) already
+         * serializes compact-cache reuse, resident-slot eviction and the
+         * selected-id tensor against the previous layer's MoE consumer, while
+         * scratch buffers stay stream-ordered; the Engram overwrite and the
+         * final-token drain below are kept. */
+        (g->tp_world == 1u && g->streaming && !g->quality && !g->imatrix &&
+         !g->image_count && !g_expert_profile.active &&
+         getenv("DS4_ROCM_V41_STREAM_QUEUE_LAYERS") &&
+         !getenv("DS4_ROCM_DISABLE_V41_RESIDENT_QUEUE")) ||
 #endif
         (g->tp_world == 2 && !g->imatrix &&
          !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"));
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        ds41_dec_phases before;
+        memset(&before, 0, sizeof(before));
+        if (ds41_decprof_enabled()) before = g_v41_decprof.tok;
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
@@ -41853,7 +41997,23 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        const double t_drain = ds41_decprof_now();
         if (drain && !ds4_gpu_end_commands()) ok = false;
+        ds41_decprof_add(&g_v41_decprof.tok.gpu_wait, t_drain);
+        if (g_v41_decprof.layer_on) {
+            const ds41_dec_phases *now_p = &g_v41_decprof.tok;
+            fprintf(stderr,
+                    "ds4: V4.1 decode layer=%u pre=%.2f moe=%.2f post=%.2f "
+                    "read=%.2f plan=%.2f launch=%.2f gpu=%.2f drain=%d\n",
+                    il, (now_p->pre - before.pre) * 1000.0,
+                    (now_p->moe - before.moe) * 1000.0,
+                    (now_p->post - before.post) * 1000.0,
+                    (now_p->sel_read - before.sel_read) * 1000.0,
+                    (now_p->sel_plan - before.sel_plan) * 1000.0,
+                    (now_p->moe_launch - before.moe_launch) * 1000.0,
+                    (now_p->gpu_wait - before.gpu_wait) * 1000.0,
+                    drain ? 1 : 0);
+        }
 #ifdef DS4_ROCM_BUILD
         if (ds41_tp_failed(g)) ok = false;
 #else
@@ -41887,6 +42047,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         g->valid = false;
         return false;
     }
+    if (t_step0 > 0.0) ds41_decprof_print_token(token, g->pos, now_sec() - t_step0);
     g->history = next_history;
     g->pos++;
     return true;
@@ -41977,6 +42138,20 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         ds4_gpu_stream_expert_cache_configured_count() >= DS4_N_LAYER * DS4_N_EXPERT / 2u)
         minimum = 1024u;
 #endif
+    /* Opt-in: the layer-major sweep reads only experts missing from the
+     * resident cache, so a warm cache can beat per-token decode-style prefill
+     * below the 256-token default. Lowering it trades a bigger sweep read
+     * (missing full layers) against the per-token decode-path cost. */
+    if (g->streaming) {
+        const char *min_env = glm_graph_env_value(
+                "DS4_ROCM_V41_PREFILL_MIN_TOKENS",
+                "DS4_METAL_V41_PREFILL_MIN_TOKENS");
+        if (min_env && min_env[0]) {
+            char *end = NULL;
+            const long v = strtol(min_env, &end, 10);
+            if (end != min_env && v >= 2 && v <= 4096) minimum = (uint32_t)v;
+        }
+    }
     if (remaining < minimum) return 1;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     /* Keep a medium SSD append in one layer sweep without changing its
@@ -71751,11 +71926,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const char *expert_hotlist_path = getenv("DS4_EXPERT_HOTLIST");
     if ((expert_profile_path && expert_profile_path[0]) ||
         (expert_hotlist_path && expert_hotlist_path[0])) {
-        if (e->backend == DS4_BACKEND_METAL) {
+        /*
+         * The profiler itself is host-side: it consumes the routed expert ids
+         * and weights read back from the graph. Metal records them in its
+         * decode and prefill paths; the V4.1 ROCm decode path records them in
+         * ds41_stream_selected_begin(). Backends without a recording point
+         * stay rejected so they cannot silently produce an empty profile.
+         */
+        bool profiler_backend = e->backend == DS4_BACKEND_METAL;
+#ifdef DS4_ROCM_BUILD
+        profiler_backend = profiler_backend ||
+            (e->backend == DS4_BACKEND_CUDA &&
+             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
+#endif
+        if (profiler_backend) {
             ds4_expert_profile_init(expert_profile_path, expert_hotlist_path);
         } else {
             fprintf(stderr,
-                    "ds4: expert profile/hotlist is Metal-only for now; ignoring for %s backend\n",
+                    "ds4: expert profile/hotlist is not available for %s backend; ignoring\n",
                     ds4_backend_name(e->backend));
         }
     }
@@ -72816,6 +73004,35 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         ds4_bytes_to_gib(e->ssd_streaming_prefill_headroom_bytes),
                         ds4_bytes_to_gib(e->ssd_streaming_cache_bytes),
                         ds4_bytes_to_gib(ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions)));
+                /*
+                 * Seed the resident cache before the first prefill when a
+                 * hotlist is available. V4.1 has no built-in table yet, so
+                 * this only acts on DS4_ROCM_STREAMING_EXPERT_HOTLIST (a file
+                 * produced by the ROCm expert profiler); without one it is a
+                 * no-op. The per-layer prefill seed still fills the cache from
+                 * the prompt itself after prefill.
+                 */
+                if (!glm_graph_env_present(
+                        "DS4_ROCM_V41_DISABLE_STREAMING_SEED_BEFORE_PREFILL",
+                        "DS4_METAL_V41_DISABLE_STREAMING_SEED_BEFORE_PREFILL")) {
+                    ds4_gpu_graph seed_graph;
+                    memset(&seed_graph, 0, sizeof(seed_graph));
+                    seed_graph.quality = e->quality;
+                    seed_graph.ssd_streaming = e->ssd_streaming;
+                    seed_graph.ssd_streaming_cold = e->ssd_streaming_cold;
+                    seed_graph.streaming_preload_experts =
+                        e->ssd_streaming_preload_experts;
+                    if (!metal_graph_seed_streaming_expert_cache_from_hotlist(
+                                &seed_graph,
+                                &e->model,
+                                &e->weights)) {
+                        fprintf(stderr,
+                                "ds4: V4.1 SSD failed to seed the expert cache from the hotlist\n");
+                        ds4_engine_close(e);
+                        *out = NULL;
+                        return 1;
+                    }
+                }
             }
         }
 #endif
@@ -86443,12 +86660,20 @@ int ds4_session_frontier_hint(const ds4_session *s, int desired_pos) {
             if ((int)pos > desired_pos) continue;
             /* An exact frontier may only serve an empty suffix with logits. */
             if (pos == (uint32_t)desired_pos && !(state & 1u)) continue;
-            if (pos > (uint32_t)best) best = (int)pos;
+            if ((int)pos > best) best = (int)pos;
         }
     }
 #else
     (void)s;
     (void)desired_pos;
+#endif
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (ds41_frontier_debug_enabled()) {
+        fprintf(stderr, "ds4: frontier hint desired=%d best=%d ready=%d\n",
+                desired_pos, best, s ? s->ds41_graph_ready : 0);
+        if (s && s->ds41_graph_ready)
+            ds41_frontier_debug_ring(&s->ds41_graph, "hint-ring", desired_pos);
+    }
 #endif
     return best;
 }

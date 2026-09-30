@@ -937,11 +937,21 @@ static cuda_hipblaslt_gemm_plan *v41_engram_lt_plan(uint32_t rows) {
     if (!g_hipblaslt_ready) return NULL;
     int version = 0;
     char revision[128] = {0};
-    if (hipblasLtGetVersion(g_hipblaslt, &version) != HIPBLAS_STATUS_SUCCESS ||
-        hipblasLtGetGitRevision(g_hipblaslt, revision) != HIPBLAS_STATUS_SUCCESS ||
-        version != 100401 || strcmp(revision, "8d1ae90e") != 0) return NULL;
-    return hipblaslt_gemm_plan_get(25600u, rows, 6144u,
-        "V4.1 Engram F16/F32", HIP_R_32F, 2539);
+    const bool qualified =
+        hipblasLtGetVersion(g_hipblaslt, &version) == HIPBLAS_STATUS_SUCCESS &&
+        hipblasLtGetGitRevision(g_hipblaslt, revision) == HIPBLAS_STATUS_SUCCESS &&
+        version == 100401 && strcmp(revision, "8d1ae90e") == 0;
+    if (qualified) {
+        return hipblaslt_gemm_plan_get(25600u, rows, 6144u,
+            "V4.1 Engram F16/F32", HIP_R_32F, 2539);
+    }
+    /* Unqualified revision: the opt-in heuristic keeps the matrix path (and
+     * its F16-range check) instead of the per-row fallback kernels. */
+    if (hipblaslt_prefill_heuristic_enabled()) {
+        return hipblaslt_gemm_plan_get(25600u, rows, 6144u,
+            "V4.1 Engram F16/F32 heuristic", HIP_R_32F, -1);
+    }
+    return NULL;
 }
 
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -953,7 +963,8 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !cuda_tensor_has_elems2(in, width, rows, 4u) || !cuda_tensor_has_elems2(out, outputs, rows, 4u)) return 0;
     if (width == 6144u && outputs == 25600u && rows >= 32u && rows <= 2048u &&
-        ds4_rocm_is_gfx1151() && !g_quality_mode && !cuda_runtime_config()->graph_dump) {
+        ds4_rocm_gfx1151_flag("DS4_ROCM_F16_LT_PREFILL") && !g_quality_mode &&
+        !cuda_runtime_config()->graph_dump) {
         const __half *w = (const __half *)cuda_model_range_ptr(
             model_map, weight_offset, weight_bytes, "V4.1 exact Engram F16");
         if (!w) return 0;

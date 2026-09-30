@@ -3014,7 +3014,26 @@ static int cuda_stream_layer_expert_cache_load(
     slot.up = slot.base + gate_bytes;
     slot.down = slot.base + gate_pair_bytes;
 
-    const uint64_t read_chunk = 32ull * 1048576ull;
+    /* Chunk size trades syscall count against pinned staging per worker.
+     * 32 MiB is the measured default; DS4_ROCM_STREAM_LAYER_CHUNK_MB (1..64)
+     * lets the target machine A/B larger reads without changing the default. */
+    uint64_t read_chunk = 32ull * 1048576ull;
+    {
+        const char *env = getenv("DS4_ROCM_STREAM_LAYER_CHUNK_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long mb = strtoul(env, &end, 10);
+            if (end != env && *end == '\0' && errno == 0 && mb >= 1 && mb <= 64) {
+                read_chunk = (uint64_t)mb << 20;
+            }
+        }
+    }
+    /* Keep the job count inside the pool limit whatever the chunk size is. */
+    const uint64_t min_chunk =
+        (total_bytes + DS4_ROCM_STREAM_READ_MAX_JOBS - 1u) /
+        DS4_ROCM_STREAM_READ_MAX_JOBS;
+    if (read_chunk < min_chunk) read_chunk = min_chunk;
     const uint64_t gate_chunks =
         (gate_bytes + read_chunk - 1u) / read_chunk;
     const uint64_t down_chunks =

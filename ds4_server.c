@@ -11730,6 +11730,11 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * retains sampled hidden reasoning that a rewind would drop). */
     if (common > 0 && common < live_pos && token_image_prefix) {
         const int snap = ds4_session_frontier_hint(slot->session, common);
+        const char *fdbg = getenv("DS4_ROCM_V41_FRONTIER_DEBUG");
+        if (fdbg && fdbg[0] != '\0' && strcmp(fdbg, "0") != 0)
+            fprintf(stderr,
+                    "ds4-server: reuse probe frontier common=%d live=%d prompt=%d hint=%d\n",
+                    common, live_pos, req->prompt.len, snap);
         if (snap >= 0) {
             pr.kind = REUSE_MEMORY_REWIND;
             pr.reuse_tokens = snap;
@@ -15753,6 +15758,8 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--expert-profile")) {
+            c.engine.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {

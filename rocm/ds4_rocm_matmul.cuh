@@ -1012,8 +1012,9 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
             hipblaslt_prefill_solution_index((uint32_t)out_dim, (uint32_t)n_tok,
                                             (uint32_t)in_dim) >= 0 &&
             !g_glm_model && !g_quality_mode &&
-            g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
-            ds4_rocm_is_gfx1151()) {
+            (g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E ||
+             hipblaslt_prefill_heuristic_enabled()) &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_LT_PREFILL")) {
             if (hipblaslt_gemm_tn_f16_out_f32_prefill((float *)out->ptr, w, xh,
                         (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim)) return 1;
         }
