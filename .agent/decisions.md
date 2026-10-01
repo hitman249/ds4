@@ -85,3 +85,16 @@
 - Последствия: хинт начнёт возвращать снимки → сервер пойдёт по `REUSE_MEMORY_REWIND`; сервер ре-валидирует restored frontier перед доверием, поэтому
   риска порчи контекста нет — нужна лишь проверка пользователем на цели (ожидание: нет evict, replay суффикса). Коммит — отдельно от отладочной
   инструментации (`ds41_frontier_debug_*`), которая сейчас в рабочем дереве.
+
+## D10: kyuz0-ветку вливаем merge-коммитом (не rebase) — сохранённые push-коммиты
+- Что: `git merge kyuz0/feat/rocm-deepseek41-halo` поверх dcc586a. Конфликты только в ds4.c (3 хунка: free/reset графа и бюджетная печать).
+- Почему: наша ветка уже запушена в origin (dcc586a), rebase переписал бы историю; 3-way merge от общего предка cab7369 даёт чистую точку и сохраняет авторство обеих сторон.
+
+## D11: evolver-ветку вливаем как гибрид «kyuz0-код + streaming-адаптации evolver»
+- Что: конфликты разрешены в пользу kyuz0 (более новый код), а уникальные для evolver части сохранены: streaming-блок в ds41_moe_batch (запуск miss-чтений verify-строк заранее), фикс гонки компактизации (SPLIT_COMPACT_WAIT), staging-ring/compute-stream uploads/KEEP_PAGES, rows-ядра для непокрытых форм, PREFILL_QUANTUM, speculation в ds4_server, prefetch, конвертерные правила V4.1.
+- Почему: две независимые реализации одного и того же DSpark drafting несовместимы по символам (автомердж дал дубли ds41_draft_*). kyuz0-код новее и покрыт их тестами; streaming-адаптации evolver — единственный путь к DSpark на целевой машине (128 GB не вмещает resident-экспертов).
+- Следствие: resident-only ограничения kyuz0 сохранены как дефолт; DSpark-over-SSD доступен только при `DS4_ROCM_DSPARK_STREAMING=1`.
+
+## D12: DSpark-over-SSD — opt-in env, не дефолт
+- Что: `DS4_ROCM_DSPARK_STREAMING=1` снимает guard `g->streaming` в `ds41_draft_init` и допускает `--dspark --ssd-streaming` в гейте движка. Без env поведение и сообщения прежние (resident-only).
+- Почему: kyuz0 явно помечает DSpark как resident-only (guard + docs); включать streaming-путь по умолчанию без замера на цели нельзя (нет модели V4.1 на тестовом ПК). Env даёт A/B без пересборки, как в D2/D7.

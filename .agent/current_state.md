@@ -106,3 +106,41 @@
 - Патч: `/home/neiron/work/ds-4.1-flash/rocm72-perf.patch` (685 строк, 8 файлов, +358/-41; перегенерирован против pristine `git@github.com:hitman249/ds4.git` ветка `7e0276f`, включает фикс frontier hint; тест-хука `DS4_ROCM_FORCE_GFX1151` в нём нет)
 - .agent/*.md (память), misc/rocm72-tuning.md (заметка, gitignored); harness'ы вне репо: tmp/v41count.c, tmp/v41split.c, tmp/v41split_big.c
 - Тест-хук `DS4_ROCM_FORCE_GFX1151` живёт только в копии на тестовом ПК (нужен harness'у для gfx1151-ядер на gfx1150); при синке rocm/ его надо накладывать заново.
+
+## Сделано (сессия 7, 01.10) — вливание kyuz0 и evolver в fix-kv-cache
+Задача: влить последние изменения kyuz0/feat/rocm-deepseek41-halo и полезные изменения evolver/strix-halo-v41-dspark-pr.
+Оба внешних репозитория добавлены как remote'ы: `kyuz0` (https://github.com/kyuz0/ds4.git), `evolver` (https://github.com/evolvemarketingitalia/ds4.git).
+Общий предок обеих ветвей и нашей — cab7369 (origin/feat/rocm-deepseek41-halo tip).
+- kyuz0 tip d32febf: 16 коммитов (DSpark resident на ROCm + конвертер support-GGUF + prefill-тюнинг: F16/Q8 projections, Gufo attention, fused prefill MoE, tiny HC/router).
+- evolver tip 78b3de1: 13 коммитов (V4.1 DSpark поверх SSD-streaming — порт antirez/ds4 PR #1073, bf16-rounding fusion, DS4_SERVER_PREFILL_QUANTUM, split-детерминизм, KEEP_PAGES, конвертер FP8/markov-имена).
+- Наш dcc586a: split экспертов (дефолт gfx1151) + ROCm 7.2 perf-патч + фикс frontier hint.
+
+### kyuz0 merge (merge-probe-kyuz0, коммит 2d006e9)
+- Конфликты только в ds4.c (3 хунка): free/reset graph (draft+frontier) и печать бюджета (ds41_engine_graph_bytes + наш hotlist-сид). Оба разрешены «оставить оба».
+- Сборка на тестовом ПК (gfx1150, HIP_VISIBLE_DEVICES=1): `make strix-halo ROCM_ARCH=gfx1150` — чисто (до правок evolver-merge).
+
+### evolver merge (merge-probe-evolver) — гибрид
+Ключевой факт: у evolver и kyuz0 ДВЕ независимые реализации V4.1 DSpark drafting (одна resident-only у kyuz0, другая streaming-capable у evolver). Автомердж дал ДУБЛИ всех ds41_draft_* функций (киуз0-блок в середине файла, evolver-блок в конце) — удалил evolver-дубликаты (370 строк), оставив kyuz0-код как базу.
+- Разрешение конфликтов: ds4.c (23) → ours (kyuz0), ds4_help.c (1) → ours, moe_launch.cuh (2) → ours (наша split-политика DS4_ROCM_V41_MOE_SPLIT, дефолт gfx1151) с сохранением evolver-фикса SPLIT_COMPACT_WAIT; v41.cuh (2) → kyuz0-пути первыми, evolver-rows-ядра остаются для непокрытых форм (row 7 / rows 7-8).
+- Автомердж принёс: staging-ring + compute-stream uploads + KEEP_PAGES + compaction-wait (runtime.cuh), evolver-streaming-блок в ds41_moe_batch, PREFILL_QUANTUM + speculation в ds4_server.c, prefetch-подсистему, rows-ядра, конвертерные имена markov_head.embed/head + FP8 block size из scale shape.
+- Исправлены дубликаты автомерджа: struct-члены (n_expert в summary/weights, draft в graph, ds41_dspark в engine), две декларации/реализации ds4_gpu_dsv41_markov_chain (оставлена kyuz0-версия с transposed_head), short-prefill (возврат kyuz0-поведения на ROCm: short_count=0 + guard).
+- Включён opt-in DSpark-over-SSD: `DS4_ROCM_DSPARK_STREAMING=1` — снимает guard `g->streaming` в ds41_draft_init и допускает `--dspark` + `--ssd-streaming` в гейте движка; по умолчанию поведение kyuz0 (resident-only) не меняется.
+
+### Проверки
+- Сборка gfx1150 после каждого шага (итеративно устраняются ошибки автомерджа). Тесты (test-deepseek41-rocm / test-rocm) — после финальной сборки.
+- E2E DSpark на тестовом ПК невозможен (моделей V4.1 нет) — финальный тест делает пользователь на цели.
+
+### Изменённые ветки
+- `merge-probe-kyuz0` = dcc586a + kyuz0 merge (2d006e9).
+- `merge-probe-evolver` = merge-probe-kyuz0 + evolver merge (в работе).
+- Цель: перенести оба merge-коммита в feat/rocm-deepseek41-halo-fix-kv-cache после зелёных тестов.
+
+### Результаты проверок (01.10, продолжение)
+- Сборка gfx1150 (HIP_VISIBLE_DEVICES=0): `make strix-halo ROCM_ARCH=gfx1150` — 0 errors, 0 warnings.
+- `make test-deepseek41-rocm` c `HIP_VISIBLE_DEVICES=0 DS4_ROCM_FORCE_GFX1151=1` — **PASS 188** изолированных фигур (включая DSpark-ядра kyuz0: hc_mean/router/markov).
+- Важно: без `DS4_ROCM_FORCE_GFX1151=1` тесты падают (native-gfx1150 fallback ≠ gfx1151-оракулы).
+- На тестовом ПК iGPU теперь HIP-индекс 0 (RX 7800M в HIP не виден): `HIP_VISIBLE_DEVICES=1` → `no ROCm-capable device is detected`.
+- Найденные и исправленные проблемы гибрида (evolver merge):
+  1. Автомердж дал дубли ds41_draft_* (удалён evolver-блок 370 строк), дубли struct-членов (n_expert×2, draft×2, ds41_dspark×2), дубли ds4_gpu_dsv41_markov_chain/hc_mean (оставлены kyuz0-версии), дубли short-prefill (возврат kyuz0-поведения на ROCm).
+  2. `attention-output` (one-row, rows=1): evolver-путь с fused bf16-округлением даёт другую арифметику, чем kyuz0-оракул теста → восстановлены kyuz0-ядра `v41_grouped_q8_f32_blocks4_kernel`/`v41_q8_f32_blocks4_kernel` + всегда `ds4_gpu_dsv41_quantize(low)`; fused-вариант остался только для rows 7..8.
+  3. `ds41_dspark_streaming_enabled()` перенесён в безусловную секцию (используется гейтом вне `#ifdef DS4_HAS_DEEPSEEK41_GPU`).

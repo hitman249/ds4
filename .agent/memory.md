@@ -66,7 +66,10 @@ prefill 65 токенов = 17.5 с (3.71 t/s), decode ~9-9.5 t/s.
 - **Ловушка: сентинел -1 в unsigned-сравнениях**: в этом коде часто `int best = -1`; сравнивать с unsigned-позициями можно только как `(int)pos > best` или
   `best < 0 || pos > best_pos`. `pos > (uint32_t)best` при `best=-1` молча никогда не истинно (`UINT32_MAX`) — именно так возник баг frontier hint.
 - **Тестовый ПК теперь с двумя GPU**: RX 7800M (gfx1101, индекс 0) + Radeon 890M (gfx1150, индекс 1). Бинарь под gfx1150 на индексе 0 падает
-  с HIP-ассерцией `StatCO::getStatFunc` → **все сборки/тесты запускать с `HIP_VISIBLE_DEVICES=1`** (проверено PASS 118 и все host-тесты).
+  с HIP-ассерцией `StatCO::getStatFunc` → все сборки/тесты запускать с явным выбором устройства.
+  **ВАЖНО (изменилось 01.10): на тестовом ПК теперь iGPU = HIP-индекс 0** (`HIP_VISIBLE_DEVICES=1` даёт `no ROCm-capable device is detected`; RX 7800M в HIP не виден).
+  Команды: `HIP_VISIBLE_DEVICES=0 make strix-halo ROCM_ARCH=gfx1150`; для kyuz0-тестов V4.1 на gfx1150 обязателен тест-хук `DS4_ROCM_FORCE_GFX1151=1`
+  (иначе native-gfx1150 fallback-пути не совпадают с gfx1151-оракулами тестов).
 - **Семплинг сервера (важно для A/B)**: env `DS4_SERVER_DEFAULT_TEMP` **не существует** (в репо нет); дефолт `DS4_DEFAULT_TEMPERATURE = 1.0f` (`ds4.h:59`, `docs/SERVER.md:46`),
   в thinking-режиме thinking-дефолты (`top_k=0`, `min_p=0.05`), **явные параметры запроса приоритетны** (`ds4_server.c:13971`), **seed случаен на каждый запрос**
   (`random_bytes` из `/dev/urandom`, `ds4_server.c:97/13916`) → один и тот же запрос даёт **разный текст на каждом вызове**. Для детерминизма — `"temperature": 0` **в теле запроса**
@@ -92,8 +95,8 @@ prefill 65 токенов = 17.5 с (3.71 t/s), decode ~9-9.5 t/s.
 
 ## Полезные команды
 - Сборка/тесты на тестовом ПК (внутри контейнера, без CPATH и -L — дефолты Makefile уже починены):
-  `distrobox enter comfyui-rocm -- bash -lc 'cd ~/work/ds-4.1-flash/ds4 && HIP_VISIBLE_DEVICES=1 make -B ds4 ds4-server ROCM_ARCH=gfx1150 && HIP_VISIBLE_DEVICES=1 make test-rocm ROCM_ARCH=gfx1150'`
-  (`HIP_VISIBLE_DEVICES=1` обязателен: на тестовом ПК две GPU, iGPU = индекс 1)
+  `distrobox enter comfyui-rocm -- bash -lc 'cd /home/neiron/work/ds-4.1-flash/ds4 && HIP_VISIBLE_DEVICES=0 make strix-halo ROCM_ARCH=gfx1150 && HIP_VISIBLE_DEVICES=0 DS4_ROCM_FORCE_GFX1151=1 make test-rocm ROCM_ARCH=gfx1150'`
+  (`HIP_VISIBLE_DEVICES=0`: на тестовом ПК iGPU = индекс 0; внутри distrobox HOME другой — используй абсолютный путь /home/neiron/work/ds-4.1-flash/ds4)
 - Патч перегенерируется из pristine-чекаута: `git clone --depth 1 --branch feat/rocm-deepseek41-halo-fix-kv-cache git@github.com:hitman249/ds4.git /tmp/ds4-pristine`,
   скопировать изменённые файлы (8 шт.: ds4.c, ds4_help.c, ds4_server.c + 5 rocm/*.cuh) и `git -C /tmp/ds4-pristine diff > rocm72-perf.patch`.
   Проверка: `git -C /tmp/ds4-pristine reset --hard HEAD` → `git apply --check` + `patch -p1 --dry-run` → apply → sha256 всех 8 файлов совпадают с рабочей копией → снова `reset --hard` (pristine оставить чистым).
