@@ -1,10 +1,12 @@
 # Память проекта: ds4 (DwarfStar) — ROCm gfx1151 / Strix Halo
 
-## Состояние ветки (01.10)
-Ветка: `feat/rocm-deepseek41-halo-fix-kv-cache`, HEAD **69e05e0** (запушена в origin/hitman249):
+## Состояние ветки (11.10)
+Ветка: `feat/rocm-deepseek41-halo-fix-kv-cache`, HEAD **bbe74ae** (запушена в origin/hitman249):
 `dcc586a` (split экспертов дефолт gfx1151 + ROCm 7.2 perf-патч + фикс frontier hint)
 → `2d006e9` merge kyuz0/feat/rocm-deepseek41-halo (DSpark resident на ROCm, prefill-тюнинг, конвертер support-GGUF)
-→ `69e05e0` merge evolver/strix-halo-v41-dspark-pr (гибрид: DSpark-over-SSD opt-in `DS4_ROCM_DSPARK_STREAMING=1`, PREFILL_QUANTUM, split-детерминизм, KEEP_PAGES, prefetch).
+→ `69e05e0` merge evolver/strix-halo-v41-dspark-pr (гибрид: DSpark-over-SSD opt-in `DS4_ROCM_DSPARK_STREAMING=1`, PREFILL_QUANTUM, split-детерминизм, KEEP_PAGES, prefetch)
+→ `12b2908` merge kyuz0/feat/rocm-deepseek41-halo @ **815e8fb** (3 коммита: halo-дерево prefill-ядер gfx1151 + c77cb9c clean-фикс)
+→ `bbe74ae` фикс сборки halo-blob на clang ROCm 7.2 (`instprefsize`).
 Внешние remote'ы добавлены: `kyuz0` = https://github.com/kyuz0/ds4.git, `evolver` = https://github.com/evolvemarketingitalia/ds4.git.
 Цели пользователя: поддержка DSpark + производительность; целевая машина использует SSD streaming (resident-DSpark kyuz0 на 128 GB невозможен).
 Базовый лог пользователя (ds4-server, Q2, `--ssd-streaming-cache-experts 96GB --ctx 500000`):
@@ -96,6 +98,17 @@ prefill 65 токенов = 17.5 с (3.71 t/s), decode ~9-9.5 t/s.
 - V4.1 НЕ поддерживает DSpark/спек-декод (`docs/MODELS.md:93`), поэтому DSpark-пути не важны.
 - Engram: таблицы disk-only; проекция `engram_kv` (6144×25600 F16, 2 слоя: blk.1 и blk.14) — в decode rows=1 идёт через
   `ds4_gpu_matmul_f16_tensor` (fallback), в prefill rows>=32 через Lt-план/`engram_lds_token_reuse`.
+- **Halo-дерево kyuz0 (11.10, merge 12b2908)**: prefill-ядра для resident-моделей на gfx1151 — `rocm/halo/{attention,moe,q2,output_a,output_b,shared_gu}`,
+  обёртки `rocm/ds4_rocm_halo_*.cuh` + `rocm/ds4_rocm_v41_gate_up.h`; все пути runtime-gated `ds4_rocm_is_gfx1151()` и моделью
+  (`g_halo_prefill_model` = V4 Flash 43 слоя / `g_deepseek41_model` = V4.1); на других GPU/моделях не активируются.
+  Сборка: `rocm/halo/output_b/code.inc` генерируется `scripts/build_halo_output_b.py` из `rocm/halo/output_b/s4_d2.s` (при arch != gfx1151 пишется пустой blob).
+  Makefile: `ROCM_CFLAGS` = наш explicit `-I/opt/rocm/include` + kyuz0 `-std=c++20` (MMQ-объекты переопределяют на `-std=c++17` в `ROCM_MMQ_FLAGS`).
+- **Тесты halo (kyuz0)**: `make test-halo-shapes` (CPU-only, PASS на gfx1150); `make test-halo-moe-rocm` и `ds4-kernel-v41-gate-up[-oracle]` — gfx1151-оракулы,
+  на gfx1150 падают (исходники идентичны kyuz0-ветке → это arch-эффект, не merge). QA-требование kyuz0 (`QA_BEFORE_RELEASES.md`): гонять `test-halo-shapes test-halo-moe-rocm`
+  при 2K/4K × 3 паттерна роутинга после изменений bulk-prefill ядер.
+- **ROCm 7.2 clang не умеет `instprefsize()` MCExpr** (LLVM main умеет; clang 22.0.0git в контейнере — нет): сборка gfx1151 падала на
+  `.amdhsa_inst_pref_size ((instprefsize(24012)<<4)&1008)>>4` в `s4_d2.s`. Значение детерминировано для gfx1151 (кэш-линия инструкций 128 B, поле INST_PREF_SIZE 6 бит):
+  `min(ceil(bytes/128), 63) = 63`. Фикс `bbe74ae` в `scripts/build_halo_output_b.py` подставляет литерал (blob байт-в-байт тот же); сам `s4_d2.s` не менялся (hash в `docs/halo/sources.json`).
 
 ## Полезные команды
 - Сборка/тесты на тестовом ПК (внутри контейнера, без CPATH и -L — дефолты Makefile уже починены):
@@ -104,7 +117,9 @@ prefill 65 токенов = 17.5 с (3.71 t/s), decode ~9-9.5 t/s.
 - Патч перегенерируется из pristine-чекаута: `git clone --depth 1 --branch feat/rocm-deepseek41-halo-fix-kv-cache git@github.com:hitman249/ds4.git /tmp/ds4-pristine`,
   скопировать изменённые файлы (8 шт.: ds4.c, ds4_help.c, ds4_server.c + 5 rocm/*.cuh) и `git -C /tmp/ds4-pristine diff > rocm72-perf.patch`.
   Проверка: `git -C /tmp/ds4-pristine reset --hard HEAD` → `git apply --check` + `patch -p1 --dry-run` → apply → sha256 всех 8 файлов совпадают с рабочей копией → снова `reset --hard` (pristine оставить чистым).
-- Кросс-сборка под цель: `make strix-halo` (ROCM_ARCH=gfx1151) — компиляция проходит на gfx1150-ПК.
+- Кросс-сборка под цель: `make strix-halo` (ROCM_ARCH=gfx1151). С 11.10 для gfx1151 нужен blob halo: правило `rocm/halo/output_b/code.inc` вызывает `scripts/build_halo_output_b.py`
+  (на clang ROCm 7.2 без фикса `instprefsize` сборка падает — фикс уже в ветке).
+- Тесты halo (на gfx1151): `make test-halo-shapes test-halo-moe-rocm`; `make ds4-kernel-v41-gate-up ds4-kernel-v41-gate-up-oracle` (без phony-цели, запускать бинарь вручную).
 - Синк файлов: `sshpass -p 1234 rsync -az --exclude .git -e ssh <files> neiron@192.168.3.168:~/work/ds-4.1-flash/ds4/`
 - Проверка «апстримный ли баг/фича»: `git log -S "<symbol>" -- ds4.c` (коммит-внедрение), `git show origin/main:ds4.c | rg <symbol>`,
   `curl -sSL https://raw.githubusercontent.com/antirez/ds4/main/ds4.c | rg <symbol>` (upstream = antirez/ds4; база форка — 0aaea5a).

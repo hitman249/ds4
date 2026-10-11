@@ -107,3 +107,17 @@
 ## D14: support-GGUF DSpark — принимаем оба набора имён Markov-головы
 - Что: `dspark_weights_bind_optional` для V4.1 пробует `markov_head.embed.weight`/`head.weight` (конвертер kyuz0), при отсутствии — `markov_head.markov_w1.weight`/`markov_w2.weight` (тулчейн antirez PR #1073 / evolver). Учёт missing_tensors — вручную после обеих попыток.
 - Почему: kyuz0-конвертер (`gguf-tools/deepseek41_quantize.py`) пишет embed/head, а `deepseek4-quantize.c` (evolver) маппит embed/head → markov_w1/w2; пользователь может собрать support-GGUF любым из них. Иначе при чужом тулчейне движок отверг бы support-модель («missing tensors»).
+
+## D15: Makefile-конфликт при вливании halo-коммитов kyuz0 (11.10) — берём обе стороны
+- Что: kyuz0 добавил `-std=c++20` в `ROCM_CFLAGS` (нужен halo-дереву), мы имели explicit `-I/opt/rocm/include` в `ROCM_CFLAGS` и `-L/opt/rocm/lib -Wl,-rpath,/opt/rocm/lib` в `ROCM_LDLIBS`
+  (нужны для сборки в контейнере тестового ПК без CPATH/-L). Конфликтный хунк разрешен как **объединение**: `-std=c++20` + наши пути. `ROCM_MMQ_FLAGS` переопределяет на `-std=c++17` после, поэтому MMQ-объекты не меняют стандарт.
+- Почему: обе стороны нужны: без c++20 halo .hpp/.hip не соберутся; без explicit-путей сборка/линковка в контейнере падает. Проверено: сборки gfx1150 и gfx1151 — 0 errors/0 warnings.
+- Следствие: при следующих merge kyuz0 в Makefile конфликт будет повторяться — разрешать тем же объединением.
+
+## D16: `instprefsize()` фиксим в build-скрипте, а не в `s4_d2.s`
+- Что: `scripts/build_halo_output_b.py` (не hash-tracked) перед сборкой blob заменяет `instprefsize(<bytes>)` на вычисленное значение для gfx1151 (`min(ceil(bytes/128), 63)`);
+  сам `rocm/halo/output_b/s4_d2.s` не трогаем (его `port_sha256` в `docs/halo/sources.json` остаётся валидным).
+- Почему: clang 22.0.0git (ROCm 7.2 на тестовом ПК) не поддерживает MCExpr-функцию `instprefsize()` из LLVM main; в LLVM main значение = `min(ceil(bytes/CacheLine), MaxVal)`,
+  где для gfx1151 CacheLine=128 (FeatureGFX11 → FeatureInstCacheLineSize128), поле INST_PREF_SIZE = 6 бит (`COMPUTE_PGM_RSRC3_GFX11_INST_PREF_SIZE`, width 6), т. е. для 24012 B → 63.
+  Подстановка литерала даёт тот же код-объект на любом тулчейне (проверено: .hsaco 28504 B в обоих вариантах), поэтому это совместимость, а не обход проверки.
+- Альтернатива (отвергнута): правка `s4_d2.s` ломает provenance-hash и конфликтует при обновлениях kyuz0. Откатить фикс можно, если на цели clang уже умеет `instprefsize()`.

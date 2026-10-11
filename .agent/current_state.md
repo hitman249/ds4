@@ -1,4 +1,4 @@
-# Текущее состояние (обновлено 29.09)
+# Текущее состояние (обновлено 11.10)
 
 ## Задача
 Оптимизация производительности DeepSeek V4.1 Flash (Q2, SSD streaming) на Strix Halo gfx1151 / ROCm 7.2.
@@ -89,9 +89,11 @@
 31. Патч пересобран с фиксом и отладочной инструментацией: **685 строк, 8 файлов, +358/-41** (`/home/neiron/work/ds-4.1-flash/rocm72-perf.patch`).
     Проверено: `git apply --check` OK, `patch -p1 --dry-run` OK, после apply sha256 всех 8 файлов совпадают с рабочей копией; pristine возвращён в чистое состояние.
 
-## В работе / следующий шаг (обновлено 01.10)
-- Frontier-фикс вошёл в dcc586a (запушен); ждём подтверждения пользователя на цели (см. todo.md).
-- После merge kyuz0+evolver пользователь проверяет на цели: базовые t/s, split-детерминизм, DSpark-over-SSD (`DS4_ROCM_DSPARK_STREAMING=1`), KEEP_PAGES, PREFILL_QUANTUM.
+## В работе / следующий шаг (обновлено 11.10)
+- Merge 3 halo-коммитов kyuz0 сделан и запушен (12b2908 + фикс сборки bbe74ae); тесты на тестовом ПК зелёные (см. сессию 8 ниже).
+- Пользователь проверяет на цели: сборка/прогон после нового merge (базовые t/s, split-детерминизм, DSpark-over-SSD `DS4_ROCM_DSPARK_STREAMING=1`, KEEP_PAGES, PREFILL_QUANTUM);
+  отдельно — нужен ли фикс `instprefsize` на его ROCm (если clang на цели умеет MCExpr-функцию, сборка пройдёт и без него).
+- Halo-тесты kyuz0 (`test-halo-moe-rocm`, v41 gate/up) требуют gfx1151 и V4 Flash resident-модели — их может прогнать только пользователь на цели.
 - Затем: attention-рычаг (в профиле ~43.3 ms/token при ~4.4 GB → ~102 GB/s против ~146 у MoE-части).
 
 ## Открытые вопросы
@@ -99,6 +101,8 @@
 - Точка безубыточности sweep-пути prefill на малых count на тёплом кэше (юнит-тестами не покрыт) — ждёт замера на цели.
 
 ## Изменённые файлы (патч: 8 файлов +358/-41, 685 строк)
+- Merge 12b2908: 98 файлов kyuz0 (+21537), конфликт только Makefile (объединение `-std=c++20` + explicit ROCm-пути); halo-дерево `rocm/halo/**`, `rocm/ds4_rocm_halo_*.cuh`, `rocm/v41_gate_up/**`, tests/test_halo*, tests/test_v41_gate_up*.
+- bbe74ae: `scripts/build_halo_output_b.py` (+21, подстановка `instprefsize`); `rocm/halo/output_b/s4_d2.s` НЕ менялся.
 - ds4.c (+~230: профайлер/hotlist/сид + фазовый профилировщик + queue_layers + порог prefill + диагностика frontier), ds4_help.c, ds4_server.c (+~15)
 - ds4.c:86663 (frontier hint): фикс сентинела `(uint32_t)best` → `(int)pos > best` — в рабочем дереве и в патче (пересобран 29.09).
 - rocm/ds4_rocm_hipblaslt.cuh (+43), rocm/ds4_rocm_matmul.cuh, rocm/ds4_rocm_moe_launch.cuh (split, теперь дефолт на gfx1151), rocm/ds4_rocm_runtime.cuh (+21), rocm/ds4_rocm_v41.cuh (+23)
@@ -140,3 +144,13 @@
   1. Автомердж дал дубли ds41_draft_* (удалён evolver-блок 370 строк), дубли struct-членов (n_expert×2, draft×2, ds41_dspark×2), дубли ds4_gpu_dsv41_markov_chain/hc_mean (оставлены kyuz0-версии), дубли short-prefill (возврат kyuz0-поведения на ROCm).
   2. `attention-output` (one-row, rows=1): evolver-путь с fused bf16-округлением даёт другую арифметику, чем kyuz0-оракул теста → восстановлены kyuz0-ядра `v41_grouped_q8_f32_blocks4_kernel`/`v41_q8_f32_blocks4_kernel` + всегда `ds4_gpu_dsv41_quantize(low)`; fused-вариант остался только для rows 7..8.
   3. `ds41_dspark_streaming_enabled()` перенесён в безусловную секцию (используется гейтом вне `#ifdef DS4_HAS_DEEPSEEK41_GPU`).
+
+## Сделано (сессия 8, 11.10) — merge 3 halo-коммитов kyuz0 в fix-kv-cache
+Задача: влить kyuz0/feat/rocm-deepseek41-halo tip **815e8fb** (3 новых коммита поверх d32febf) в нашу ветку.
+- Коммиты: `3d35073` ROCm: accelerate resident V4 Flash prefill on gfx1151 (halo-дерево: output_a/output_b/q2/shared_gu/attention/moe + тесты), `c77cb9c` build: clean-target context, `815e8fb` V4.1 resident expert prefill (v41 gate/up tiles).
+- Merge-коммит **12b2908** (parents 6175859 + 815e8fb): конфликт **только Makefile** (ROCM_CFLAGS/LDLIBS) — объединён (наш explicit `/opt/rocm` пути + kyuz0 `-std=c++20`); остальные файлы автомерджем чисто (проверка на дубли символов пуста).
+- **bbe74ae**: фикс сборки gfx1151 — clang 22.0.0git (ROCm 7.2) не умеет MCExpr `instprefsize()`; скрипт `build_halo_output_b.py` подставляет `min(ceil(bytes/128),63)` (=63 для 24012 B); blob 28504 B, `.s` не тронут (provenance-hash цел).
+- Проверки на тестовом ПК (gfx1150, HIP_VISIBLE_DEVICES=0): сборка gfx1150 — 0 errors/0 warnings; `test-deepseek41-rocm` — PASS 188; `test-rocm` — RC=0 (все сводки PASS); кросс-сборка gfx1151 — 0 errors/0 warnings, blob 92854 B.
+- `make test-halo-moe-rocm` на gfx1150 падает (arch-эффект, исходники идентичны kyuz0); `test-halo-shapes` PASS (CPU).
+- Ветка запушена в origin (hitman249): bbe74ae.
+- Финальные прогоны halo/DSpark на gfx1151 — за пользователем (см. todo.md).
