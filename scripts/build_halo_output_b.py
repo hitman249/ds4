@@ -2,6 +2,7 @@
 """Assemble redistributable S4+D2 source and embed its newly linked code object."""
 import argparse
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,21 @@ p.add_argument("--arch", required=True)
 p.add_argument("--output", type=Path, required=True)
 a = p.parse_args()
 blob = b""
+
+
+def _inst_pref_size(match):
+    """Evaluate instprefsize(<code bytes>) for gfx1151.
+
+    LLVM main evaluates this MCExpr inside the assembler: the gfx1151
+    instruction cache line is 128 bytes and the INST_PREF_SIZE kernel
+    descriptor field is 6 bits wide, so the value is min(ceil(bytes/128), 63).
+    ROCm 7.2's clang (22.0.0git) predates the expression support and rejects
+    the directive, so the build substitutes the equivalent literal and keeps
+    the emitted code object byte-identical on every toolchain.
+    """
+    return str(min((int(match.group(1)) + 127) // 128, 63))
+
+
 if a.arch == "gfx1151":
     hipcc = Path(shutil.which(a.hipcc) or a.hipcc).resolve(strict=True)
     roots = [hipcc.parent, hipcc.parent.parent / "llvm/bin", hipcc.parent.parent / "lib/llvm/bin"]
@@ -25,6 +41,11 @@ if a.arch == "gfx1151":
     with tempfile.TemporaryDirectory(prefix="ds4-halo-build-") as tmp:
         obj = Path(tmp) / "output_b.o"
         module = Path(tmp) / "output_b.hsaco"
+        source_text, substitutions = re.subn(r"instprefsize\(\s*(\d+)\s*\)",
+                                             _inst_pref_size, source.read_text())
+        if substitutions:
+            source = Path(tmp) / "s4_d2.s"
+            source.write_text(source_text, encoding="utf-8")
         subprocess.run([str(clang), "--target=amdgcn-amd-amdhsa", "-mcpu=gfx1151",
                         "-x", "assembler", "-c", str(source), "-o", str(obj)], check=True)
         subprocess.run([str(linker), "-shared", str(obj), "-o", str(module)], check=True)
