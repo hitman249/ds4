@@ -1,8 +1,12 @@
 # Память проекта: ds4 (DwarfStar) — ROCm gfx1151 / Strix Halo
 
-## Задача текущей сессии
-Оптимизация производительности DeepSeek V4.1 Flash для **Strix Halo gfx1151 + ROCm 7.2**.
-Ветка: `feat/rocm-deepseek41-halo-fix-kv-cache` (HEAD 7e0276f, 22 сен).
+## Состояние ветки (01.10)
+Ветка: `feat/rocm-deepseek41-halo-fix-kv-cache`, HEAD **69e05e0** (запушена в origin/hitman249):
+`dcc586a` (split экспертов дефолт gfx1151 + ROCm 7.2 perf-патч + фикс frontier hint)
+→ `2d006e9` merge kyuz0/feat/rocm-deepseek41-halo (DSpark resident на ROCm, prefill-тюнинг, конвертер support-GGUF)
+→ `69e05e0` merge evolver/strix-halo-v41-dspark-pr (гибрид: DSpark-over-SSD opt-in `DS4_ROCM_DSPARK_STREAMING=1`, PREFILL_QUANTUM, split-детерминизм, KEEP_PAGES, prefetch).
+Внешние remote'ы добавлены: `kyuz0` = https://github.com/kyuz0/ds4.git, `evolver` = https://github.com/evolvemarketingitalia/ds4.git.
+Цели пользователя: поддержка DSpark + производительность; целевая машина использует SSD streaming (resident-DSpark kyuz0 на 128 GB невозможен).
 Базовый лог пользователя (ds4-server, Q2, `--ssd-streaming-cache-experts 96GB --ctx 500000`):
 prefill 65 токенов = 17.5 с (3.71 t/s), decode ~9-9.5 t/s.
 

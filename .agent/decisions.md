@@ -98,3 +98,12 @@
 ## D12: DSpark-over-SSD — opt-in env, не дефолт
 - Что: `DS4_ROCM_DSPARK_STREAMING=1` снимает guard `g->streaming` в `ds41_draft_init` и допускает `--dspark --ssd-streaming` в гейте движка. Без env поведение и сообщения прежние (resident-only).
 - Почему: kyuz0 явно помечает DSpark как resident-only (guard + docs); включать streaming-путь по умолчанию без замера на цели нельзя (нет модели V4.1 на тестовом ПК). Env даёт A/B без пересборки, как в D2/D7.
+
+## D13: one-row attention-output — арифметика kyuz0, fused-вариант evolver только для rows 7..8
+- Что: в `ds4_gpu_dsv41_attention_output_batch` восстановлены kyuz0-ядра `v41_grouped_q8_f32_blocks4_kernel` / `v41_q8_f32_blocks4_kernel` + безусловный `ds4_gpu_dsv41_quantize(low)`; evolver-вариант с fused bf16-округлением (`v41_grouped_q8_f32_blocks4_rows_kernel_t<n, true>` / `v41_q8_rows_small_launch<true>`) сохранён только для rows 7..8 (формы, которых нет у kyuz0).
+- Почему: kyuz0-тесты (`test-deepseek41-rocm`, attention-output shapes) задают строгий оракул, который evolver-арифметика не проходит (one-row: `low_got==low_ref` точно, output ≤ 2e-5). Флаг `g_v41_attn_out_rounded` при kyuz0-ядрах остаётся 0 → вызывающий делает bf16, как в kyuz0-ветке.
+- Следствие: часть fused-rounding выигрыша evolver на one-row decode теряется (остаются fused-эпилоги rms_norm/hc/swiglu и rows 7..8).
+
+## D14: support-GGUF DSpark — принимаем оба набора имён Markov-головы
+- Что: `dspark_weights_bind_optional` для V4.1 пробует `markov_head.embed.weight`/`head.weight` (конвертер kyuz0), при отсутствии — `markov_head.markov_w1.weight`/`markov_w2.weight` (тулчейн antirez PR #1073 / evolver). Учёт missing_tensors — вручную после обеих попыток.
+- Почему: kyuz0-конвертер (`gguf-tools/deepseek41_quantize.py`) пишет embed/head, а `deepseek4-quantize.c` (evolver) маппит embed/head → markov_w1/w2; пользователь может собрать support-GGUF любым из них. Иначе при чужом тулчейне движок отверг бы support-модель («missing tensors»).

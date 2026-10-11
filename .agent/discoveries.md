@@ -180,3 +180,20 @@
   (уже запушен в origin/feat/rocm-deepseek41-halo-fix-kv-cache); база форка — upstream 0aaea5a.
 - Вывод: баг fork-local (регресс в 7e0276f), не апстримный → фиксим на ветке. Ожидаемое поведение после фикса: desired=21043 → best=20480 →
   `REUSE_MEMORY_REWIND` → replay суффикса 20480..21043 (563 токена) вместо evict+prefill 21050.
+
+## 9. Слияние kyuz0 + evolver (01.10) — уроки автомерджа и тестов
+- Проверено: обе ветви независимо добавили полные реализации V4.1 DSpark drafting (`ds41_draft_*`) в разные места ds4.c; git автомердж оставил **обе** → дубли определений (сборка падает). Удалён evolver-блок (370 строк), kyuz0-код оставлен базой.
+- Автомердж также продублировал struct-члены (`n_expert` в summary и weights, `draft` в graph, `ds41_dspark` в engine) и `extern "C"`-реализации (`ds4_gpu_dsv41_markov_chain`, `ds4_gpu_dsv41_hc_mean`) — устранены в пользу kyuz0-версий (17-параметрическая markov_chain с transposed_head; hc_mean с `v41_hc_mean_kernel`).
+- Проверено: тесты kyuz0 на gfx1150 требуют **`DS4_ROCM_FORCE_GFX1151=1`** (иначе native-gfx1150 fallback-пути не совпадают с gfx1151-оракулами: e.g. q8-prefill-projection shape=21 падает без флага, PASS с ним). Итог: `make test-deepseek41-rocm` → PASS 188 фигур; `make test-rocm` → все сводки PASS (layer_pack 97/97, mgpu 114/114, gpu_args 86, TCP/TP, ds4_test --server OK).
+- Проверено: one-row attention output у evolver использует fused bf16-округление в ядре (`v41_q8_f32_blocks4_kernel_t<true>` + флаг `g_v41_attn_out_rounded`), у kyuz0 — отдельные `quantize(low)` + ядро без округления + bf16 у вызывающего. Арифметика отличается; kyuz0-оракул теста принимает только kyuz0-вариант → one-row пути восстановлены к kyuz0, fused-вариант оставлен только для rows 7..8.
+- Вывод: при слиянии двух форков одного upstream-порта нельзя доверять автомерджу в областях «одинаковая фича, разные реализации» — обязательны компиляция + прогон тестов обеих сторон.
+
+## 10. Тестовый ПК: смена HIP-индекса iGPU (01.10)
+- Проверено: `HIP_VISIBLE_DEVICES=1` → `hipGetDeviceCount=0` («no ROCm-capable device is detected»); `HIP_VISIBLE_DEVICES=0` → iGPU gfx1150. RX 7800M в HIP больше не виден (в rocminfo остаются gfx1150 и NPU).
+- Вывод: старые инструкции с `HIP_VISIBLE_DEVICES=1` устарели; сборки/тесты — `HIP_VISIBLE_DEVICES=0`.
+
+## 11. DSpark support-GGUF: какие файлы движок принимает (проверено по GGUF-заголовкам, 02.10)
+- Детекция (`support_model_detect`/`model_dspark_summary`): нужны тензоры с именами `mtp.<N>.<...>` (stages = max_index+1 >= 3) И подстроки `.main_proj.` (stage 0), `.markov_head.`, `.confidence_head.`; метаданные `dspark.*` (block_size/markov_rank/noise_token_id/target_layer_ids) — из них только `has_metadata` для сводки.
+- Проверено (HTTP range, только заголовок): эталонный `kernelpool/DeepSeek-V4.1-Flash-MXFP4-GGUF` → `DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf` (revision `22a073e5…`, 7 966 294 016 B, SHA256 `7a2217ca…`): архитектура `deepseek41-dspark`, 81 тензор, `mtp.0/1/2`, `mtp.0.main_proj/main_norm`, `mtp.2.markov_head.embed/head`, `mtp.2.confidence_head.proj`, `dspark.block_size=5`, `markov_rank=256`, 128 экспертов top-3, `noise_token_id=128799` → движок примет (все биндинги `dspark_bind_block` + опциональные hc_head для v41 закрыты).
+- Проверено: `JigSawPT/DeepSeek-V4.1-Flash-DSpark-GGUF` → `DeepSeek-V4.1-Flash-DSpark.gguf` — **не подходит**: архитектура `dflash` (llama.cpp-экспорт `convert_hf_to_gguf.py --dspark`, `dflash.dsv41_semantics`, 78 тензоров) → `detected=none`. Файлы вида `*-DSpark-draft-*.gguf` из чужих репозиториев — тоже чужие форматы.
+- Вывод: для ds4 нужен support-GGUF именно с `mtp.*` + `dspark.*` (эталон kernelpool, либо сборка `gguf-tools/deepseek41_quantize.py --dspark-out` без `--out` из shards 44-46/48).

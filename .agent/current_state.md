@@ -89,10 +89,9 @@
 31. Патч пересобран с фиксом и отладочной инструментацией: **685 строк, 8 файлов, +358/-41** (`/home/neiron/work/ds-4.1-flash/rocm72-perf.patch`).
     Проверено: `git apply --check` OK, `patch -p1 --dry-run` OK, после apply sha256 всех 8 файлов совпадают с рабочей копией; pristine возвращён в чистое состояние.
 
-## В работе / следующий шаг
-- Пользователь: проверить фикс на цели — короткая беседа, прерывание → «продолжай», с `DS4_ROCM_V41_FRONTIER_DEBUG=1`.
-  Ожидание: `frontier hint desired=... best=<снимок>` (не -1), `reuse probe frontier ... hint=<pos>` → rewind+replay суффикса, **без** `evicting checkpoint` и полного prefill.
-- Закоммитить фикс (`ds4.c:86663`) отдельно от отладочной инструментации (патч уже пересобран с фиксом).
+## В работе / следующий шаг (обновлено 01.10)
+- Frontier-фикс вошёл в dcc586a (запушен); ждём подтверждения пользователя на цели (см. todo.md).
+- После merge kyuz0+evolver пользователь проверяет на цели: базовые t/s, split-детерминизм, DSpark-over-SSD (`DS4_ROCM_DSPARK_STREAMING=1`), KEEP_PAGES, PREFILL_QUANTUM.
 - Затем: attention-рычаг (в профиле ~43.3 ms/token при ~4.4 GB → ~102 GB/s против ~146 у MoE-части).
 
 ## Открытые вопросы
@@ -126,14 +125,11 @@
 - Исправлены дубликаты автомерджа: struct-члены (n_expert в summary/weights, draft в graph, ds41_dspark в engine), две декларации/реализации ds4_gpu_dsv41_markov_chain (оставлена kyuz0-версия с transposed_head), short-prefill (возврат kyuz0-поведения на ROCm: short_count=0 + guard).
 - Включён opt-in DSpark-over-SSD: `DS4_ROCM_DSPARK_STREAMING=1` — снимает guard `g->streaming` в ds41_draft_init и допускает `--dspark` + `--ssd-streaming` в гейте движка; по умолчанию поведение kyuz0 (resident-only) не меняется.
 
-### Проверки
-- Сборка gfx1150 после каждого шага (итеративно устраняются ошибки автомерджа). Тесты (test-deepseek41-rocm / test-rocm) — после финальной сборки.
-- E2E DSpark на тестовом ПК невозможен (моделей V4.1 нет) — финальный тест делает пользователь на цели.
-
-### Изменённые ветки
-- `merge-probe-kyuz0` = dcc586a + kyuz0 merge (2d006e9).
-- `merge-probe-evolver` = merge-probe-kyuz0 + evolver merge (в работе).
-- Цель: перенести оба merge-коммита в feat/rocm-deepseek41-halo-fix-kv-cache после зелёных тестов.
+### Итог (01.10, вечер)
+- Ветка `feat/rocm-deepseek41-halo-fix-kv-cache` = **69e05e0** (dcc586a → 2d006e9 kyuz0 merge → 69e05e0 evolver merge), **запушена в origin (hitman249)**.
+- Probe-ветки удалены (коммиты достижимы из основной ветки).
+- Проверки: сборка gfx1150 — 0 errors/0 warnings; `test-deepseek41-rocm` PASS 188; `test-rocm` — все сводки PASS; кросс-сборка `make strix-halo ROCM_ARCH=gfx1151` — 0 errors.
+- E2E DSpark на тестовом ПК невозможен (моделей V4.1 нет) — финальные прогоны делает пользователь на цели (см. todo.md).
 
 ### Результаты проверок (01.10, продолжение)
 - Сборка gfx1150 (HIP_VISIBLE_DEVICES=0): `make strix-halo ROCM_ARCH=gfx1150` — 0 errors, 0 warnings.
